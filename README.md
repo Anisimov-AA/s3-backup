@@ -1,49 +1,72 @@
-# Object Backup System
+# s3-backup-system-cdk
 
-Automated S3 object backup system built with AWS CDK (Python). Maintains up to 3 backup copies per object with automatic cleanup of deleted objects.
+An automatic backup for an S3 bucket. Every file you upload gets copied to a second bucket, up to 3 versions are kept per file, and the copies are removed shortly after the original is deleted.
 
-## Architecture
+I built it with AWS CDK in Python to practice event-driven serverless design: S3 events, EventBridge, Lambda and DynamoDB.
 
-| Resource | Purpose |
-|----------|---------|
-| Bucket Src | Source S3 bucket |
-| Bucket Dst | Destination S3 bucket for backup copies |
-| Table T | DynamoDB table mapping originals to copies |
-| Replicator Lambda | Handles S3 PUT/DELETE events via EventBridge |
-| Cleaner Lambda | Runs every 1 min, deletes disowned copies older than 10s |
+```mermaid
+flowchart LR
+    User[User] -->|upload / delete| Src[(SrcBucket)]
+    Src -->|event| EB([EventBridge])
+    EB -->|upload| Rep[ReplicatorLambda]
+    EB -->|delete| Rep
+    Rep -->|copy| Dst[(DstBucket)]
+    Rep -->|ACTIVE / DISOWNED| DB[(BackupTable)]
+    Timer([every 1 min]) --> Cleaner[CleanerLambda]
+    Cleaner -->|find DISOWNED<br/>older than 10 s| DB
+    Cleaner -->|delete copy| Dst
+```
 
-## CDK Stacks
+## How it works
 
-- **StorageStack** — S3 buckets, DynamoDB table with GSI
-- **ReplicatorStack** — Replicator Lambda, EventBridge S3 event rule
-- **CleanerStack** — Cleaner Lambda, EventBridge scheduled rule
+**When a file is uploaded:**
 
-## DynamoDB Table Design
+1. `ReplicatorLambda` copies it to `DstBucket` as `{name}_{timestamp}`.
+2. It writes an ACTIVE row to DynamoDB.
+3. If that file now has more than 3 copies, it deletes the oldest one.
 
-**Main Table:** `original_key` (PK) + `copy_key` (SK)
+**When a file is deleted:**
 
-**GSI (StatusIndex):** `status` (PK) + `disowned_at` (SK)
+1. `ReplicatorLambda` marks all its copies as DISOWNED, with the time. It doesn't delete them yet.
+2. Every minute, `CleanerLambda` finds DISOWNED copies older than 10 seconds (through a DynamoDB index) and deletes them.
 
-All operations use queries — no scans needed.
+So a deleted file's backups disappear within about a minute.
 
-## Setup
+The app is split into 3 CDK stacks: `StorageStack` (the two buckets and the table), `ReplicatorStack` and `CleanerStack` (each with its Lambda and EventBridge rule). Storage deploys first.
 
-```bash
-npm install -g aws-cdk
+## Requirements
+
+- **Python 3** and the **AWS CDK CLI** (`npm install -g aws-cdk`, needs Node.js)
+- An AWS account with credentials set up and CDK bootstrapped (`cdk bootstrap`)
+
+## Run
+
+In PowerShell, from the project folder:
+
+```powershell
 python -m venv .venv
-
-# Windows
-.venv\Scripts\activate.bat
-# Mac/Linux
-source .venv/bin/activate
-
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cdk bootstrap
 cdk deploy --all
 ```
 
-## Cleanup
+Then upload and delete files in `SrcBucket` (console or CLI) and watch `DstBucket` and `BackupTable`.
 
-```bash
+Remove everything when you're done (this deletes all data):
+
+```powershell
 cdk destroy --all
+```
+
+## Code
+
+```
+app.py                            CDK entry point: Storage → Replicator → Cleaner
+backup_system/
+  storage_stack.py                buckets, table, status index
+  replicator_stack.py             ReplicatorLambda + upload/delete rules
+  cleaner_stack.py                CleanerLambda + 1-minute schedule
+lambda/
+  replicator.py                   copy + trim to 3 on upload, mark DISOWNED on delete
+  cleaner.py                      delete DISOWNED copies past the 10 s cutoff
 ```
